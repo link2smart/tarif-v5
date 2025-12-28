@@ -176,8 +176,6 @@
                         
                         if (result.candidates && result.candidates[0].content) {
                             let text = result.candidates[0].content.parts[0].text;
-                            
-                            // NETTOYAGE ROBUSTE : Trouver le premier '{' et le dernier '}'
                             const firstBrace = text.indexOf('{');
                             const lastBrace = text.lastIndexOf('}');
                             
@@ -186,7 +184,6 @@
                                 try {
                                     const data = JSON.parse(jsonStr);
                                     if (data.products && Array.isArray(data.products)) {
-                                        // Nettoyage des prix (convertir en nombre si string)
                                         const cleanProducts = data.products.map(p => ({
                                             ...p,
                                             price: typeof p.price === 'string' ? p.price.replace(',', '.') : p.price
@@ -232,18 +229,17 @@
                             validEntryIds.push(entry.id);
                             const existing = tarifs.find(t => t.id === entry.id);
 
-                            // Force update si pas de produits trouvés précédemment
                             const needsUpdate = !existing || existing.server_modified !== entry.server_modified || (!existing.products || existing.products.length === 0);
 
                             if (needsUpdate) {
                                 setSyncLog(`Traitement IA : ${entry.name}...`);
                                 try {
                                     const blob = await dbxDownloadFile(dbxConfig.token, entry.path_lower);
-                                    await delay(2000); // Pause 2s pour l'IA
+                                    await delay(1500); 
                                     const products = await analyzeTarifPDF(blob);
                                     
                                     if (products.length === 0) {
-                                        setSyncLog(`⚠️ AVERTISSEMENT: 0 produits trouvés dans ${entry.name}.`);
+                                        setSyncLog(`⚠️ 0 produits trouvés dans ${entry.name}.`);
                                     } else {
                                         setSyncLog(`✅ SUCCÈS: ${products.length} produits extraits de ${entry.name}`);
                                     }
@@ -258,7 +254,6 @@
                                     };
                                     
                                     setTarifs(prev => {
-                                        // On remplace l'ancien s'il existe
                                         const filtered = prev.filter(p => p.id !== entry.id);
                                         return [...filtered, newDoc];
                                     });
@@ -268,11 +263,8 @@
                                 } catch (fileError) {
                                     setSyncLog(`❌ ÉCHEC fichier ${entry.name} : ${fileError.message}`);
                                 }
-                            } else {
-                                // setSyncLog(`Déjà à jour : ${entry.name}`);
                             }
                         }
-                        // Nettoyage orphelins
                         setTarifs(prev => prev.filter(t => validEntryIds.includes(t.id)));
 
                     } catch (e) {
@@ -350,18 +342,38 @@
                 }
             };
 
-            // --- RECHERCHE ---
+            // --- RECHERCHE (AMELIOREE) ---
             const searchResults = useMemo(() => {
                 if (queryStr.length < 2) return [];
                 const res = [];
                 tarifs.forEach(t => {
-                    // Sécurité : on vérifie que t.products est bien un tableau
+                    let addedAsFile = false;
+
+                    // 1. Recherche dans les produits (si existants)
                     (t.products || []).forEach(p => {
-                        // Sécurité : on vérifie que p.name existe avant le toLowerCase
-                        if (p.name && String(p.name).toLowerCase().includes(queryStr.toLowerCase())) {
-                            res.push({ ...p, source: t.name, path: t.path, sourceId: t.id });
+                        const pName = p.name ? String(p.name).toLowerCase() : "";
+                        const pPack = p.packaging ? String(p.packaging).toLowerCase() : "";
+                        
+                        if (pName.includes(queryStr.toLowerCase()) || pPack.includes(queryStr.toLowerCase())) {
+                            res.push({ ...p, source: t.name, path: t.path, sourceId: t.id, type: 'product' });
                         }
                     });
+
+                    // 2. Recherche de secours : Si le nom du fichier match, on l'ajoute comme "Catalogue Complet"
+                    // Cela garantit que même si l'extraction a échoué (0 produits), le fichier est trouvable par son nom
+                    if (t.name && t.name.toLowerCase().includes(queryStr.toLowerCase())) {
+                        // On vérifie si on n'a pas déjà ajouté ce fichier via ses produits pour éviter trop de bruit
+                        // Mais ici c'est utile d'avoir l'entrée "Fichier" distincte
+                        res.push({
+                            name: "📂 " + t.name, // Indicateur visuel
+                            price: "---",
+                            packaging: "Fichier PDF",
+                            source: "Catalogue complet",
+                            path: t.path,
+                            sourceId: t.id,
+                            type: 'file'
+                        });
+                    }
                 });
                 return res;
             }, [queryStr, tarifs]);
@@ -373,6 +385,9 @@
                     (ft.fileName && ft.fileName.toLowerCase().includes(ftQueryStr.toLowerCase()))
                 );
             }, [ftQueryStr, fichesTechniques]);
+
+            // Stats pour le debug
+            const totalProductsIndexed = useMemo(() => tarifs.reduce((acc, t) => acc + (t.products ? t.products.length : 0), 0), [tarifs]);
 
             if (view === 'login') return (
                 <div className="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-blue-50 to-slate-100">
@@ -415,15 +430,32 @@
 
                                 {searchTab === 'tarifs' && (
                                     <div className="max-w-2xl mx-auto">
-                                        <div className="relative mb-8 group"><div className="absolute inset-y-0 left-4 flex items-center pointer-events-none text-slate-300 group-focus-within:text-blue-500 transition-colors"><Icon name="Search" size={20}/></div><input className="w-full pl-12 pr-4 py-4 bg-white border border-slate-200 rounded-2xl shadow-sm focus:ring-4 focus:ring-blue-50 outline-none text-lg transition-all placeholder:text-slate-300" placeholder="Rechercher un prix (ex: Pompe X200)..." value={queryStr} onChange={e => setQueryStr(e.target.value)}/></div>
+                                        <div className="text-center mb-6">
+                                            <div className="inline-flex items-center gap-2 px-3 py-1 bg-blue-50 text-blue-700 rounded-full text-xs font-bold">
+                                                <Icon name="Database" size={12}/> {totalProductsIndexed} produits indexés depuis {tarifs.length} fichiers
+                                            </div>
+                                        </div>
+
+                                        <div className="relative mb-8 group"><div className="absolute inset-y-0 left-4 flex items-center pointer-events-none text-slate-300 group-focus-within:text-blue-500 transition-colors"><Icon name="Search" size={20}/></div><input className="w-full pl-12 pr-4 py-4 bg-white border border-slate-200 rounded-2xl shadow-sm focus:ring-4 focus:ring-blue-50 outline-none text-lg transition-all placeholder:text-slate-300" placeholder="Rechercher un produit (ex: Pompe X200)..." value={queryStr} onChange={e => setQueryStr(e.target.value)}/></div>
+                                        
                                         <div className="space-y-3">
                                             {searchResults.length > 0 ? searchResults.map((p, i) => (
-                                                <div key={i} className="bg-white p-4 rounded-xl border border-slate-100 hover:border-blue-300 hover:shadow-md transition-all group flex items-center justify-between cursor-default">
+                                                <div key={i} className={`bg-white p-4 rounded-xl border transition-all group flex items-center justify-between cursor-default ${p.type === 'file' ? 'border-orange-200 bg-orange-50/30' : 'border-slate-100 hover:border-blue-300 hover:shadow-md'}`}>
                                                     <div className="flex items-center gap-4">
-                                                        <div className="w-10 h-10 bg-blue-50 text-blue-600 rounded-lg flex items-center justify-center font-bold text-lg">{p.name ? p.name.charAt(0).toUpperCase() : '?'}</div>
-                                                        <div><div className="font-bold text-slate-800">{p.name}</div><div className="text-xs text-slate-400 font-medium flex items-center gap-1"><Icon name="Box" size={10}/> {p.packaging} • <span className="text-blue-400">{p.source}</span></div></div>
+                                                        <div className={`w-10 h-10 rounded-lg flex items-center justify-center font-bold text-lg ${p.type === 'file' ? 'bg-orange-100 text-orange-600' : 'bg-blue-50 text-blue-600'}`}>
+                                                            {p.type === 'file' ? <Icon name="File" size={18}/> : (p.name ? p.name.charAt(0).toUpperCase() : '?')}
+                                                        </div>
+                                                        <div>
+                                                            <div className="font-bold text-slate-800">{p.name || "Produit sans nom"}</div>
+                                                            <div className="text-xs text-slate-400 font-medium flex items-center gap-1">
+                                                                <Icon name="Box" size={10}/> {p.packaging || '-'} • <span className="text-blue-400">{p.source}</span>
+                                                            </div>
+                                                        </div>
                                                     </div>
-                                                    <div className="text-right"><div className="text-xl font-black text-slate-800">{p.price} <span className="text-xs font-bold text-slate-400">DH</span></div><button onClick={() => openDropboxFile(p.path)} className="text-[10px] font-bold text-blue-600 hover:underline mt-1 flex items-center justify-end gap-1">Voir Source <Icon name="ExternalLink" size={10}/></button></div>
+                                                    <div className="text-right">
+                                                        <div className="text-xl font-black text-slate-800">{p.price} <span className="text-xs font-bold text-slate-400">{p.type === 'file' ? '' : 'DH'}</span></div>
+                                                        <button onClick={() => openDropboxFile(p.path)} className="text-[10px] font-bold text-blue-600 hover:underline mt-1 flex items-center justify-end gap-1">Voir Source <Icon name="ExternalLink" size={10}/></button>
+                                                    </div>
                                                 </div>
                                             )) : (
                                                 queryStr.length > 1 && <div className="text-center py-12 text-slate-400"><Icon name="Ghost" size={32} className="mx-auto mb-2 opacity-50"/><p>Aucun produit trouvé.</p></div>
