@@ -30,41 +30,62 @@
         // Configuration PDF.js
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-        // --- SERVICES DROPBOX ---
+        // --- UTILITAIRES DE DELAI ---
+        const delay = ms => new Promise(res => setTimeout(res, ms));
+
+        // --- SERVICES DROPBOX AVEC RETRY ---
         const DROPBOX_API_URL = "https://api.dropboxapi.com/2";
         const DROPBOX_CONTENT_URL = "https://content.dropboxapi.com/2";
 
+        // Fonction générique de retry pour les appels réseaux fragiles
+        const fetchWithRetry = async (url, options, retries = 3, backoff = 1000) => {
+            try {
+                const res = await fetch(url, options);
+                if (!res.ok) {
+                    // Si erreur serveur 5xx ou rate limit 429, on retry
+                    if (res.status >= 500 || res.status === 429) throw new Error(`HTTP ${res.status}`);
+                    // Sinon erreur fatale (400, 401, 409...)
+                    throw new Error(await res.text());
+                }
+                return res;
+            } catch (err) {
+                if (retries > 0) {
+                    console.warn(`Retrying ${url}... (${retries} left)`);
+                    await delay(backoff);
+                    return fetchWithRetry(url, options, retries - 1, backoff * 2);
+                }
+                throw err;
+            }
+        };
+
         const dbxListFolder = async (token, path) => {
-            const res = await fetch(`${DROPBOX_API_URL}/files/list_folder`, {
+            const res = await fetchWithRetry(`${DROPBOX_API_URL}/files/list_folder`, {
                 method: 'POST',
                 headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ path: path === '/' ? '' : path, recursive: false })
             });
-            if (!res.ok) throw new Error(await res.text());
             return await res.json();
         };
 
         const dbxDownloadFile = async (token, path) => {
-            const res = await fetch(`${DROPBOX_CONTENT_URL}/files/download`, {
+            const res = await fetchWithRetry(`${DROPBOX_CONTENT_URL}/files/download`, {
                 method: 'POST',
                 headers: { 'Authorization': `Bearer ${token}`, 'Dropbox-API-Arg': JSON.stringify({ path }) }
             });
-            if (!res.ok) throw new Error(await res.text());
             return await res.blob();
         };
 
         const dbxGetLink = async (token, path) => {
-            const res = await fetch(`${DROPBOX_API_URL}/files/get_temporary_link`, {
+            const res = await fetchWithRetry(`${DROPBOX_API_URL}/files/get_temporary_link`, {
                 method: 'POST',
                 headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ path })
             });
-            if (!res.ok) throw new Error("Impossible d'ouvrir le fichier");
             return await res.json();
         };
 
         const dbxUploadFile = async (token, path, content) => {
-            const res = await fetch(`${DROPBOX_CONTENT_URL}/files/upload`, {
+            const res = await fetchWithRetry(`${DROPBOX_CONTENT_URL}/files/upload`, {
                 method: 'POST',
                 headers: { 
                     'Authorization': `Bearer ${token}`, 
@@ -73,26 +94,8 @@
                 },
                 body: content
             });
-            if (!res.ok) {
-                const errText = await res.text();
-                if(errText.includes("files.content.write")) throw new Error("Permission Dropbox manquante : Le token doit avoir 'files.content.write'.");
-                throw new Error("Erreur Upload: " + errText);
-            }
             return await res.json();
         };
-
-        const dbxDeleteFile = async (token, path) => {
-             // Optionnel : pour nettoyer l'ancien fichier si besoin
-             const res = await fetch(`${DROPBOX_API_URL}/files/delete_v2`, {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path })
-            });
-            // On ne throw pas d'erreur si ça échoue (ex: fichier déjà supprimé), on continue
-            return res.ok;
-        };
-
-        const delay = ms => new Promise(res => setTimeout(res, ms));
 
         // --- IA GOOGLE ---
         const callIA = async (payload, key, retryCount = 0) => {
@@ -380,28 +383,52 @@
 
                 try {
                     setSyncLog("📄 Analyse Dossier Tarifs...");
-                    const listTarifs = await dbxListFolder(dbxConfig.token, dbxConfig.pathTarifs);
+                    // Tentative list folder avec gestion d'erreur
+                    let listTarifs;
+                    try {
+                        listTarifs = await dbxListFolder(dbxConfig.token, dbxConfig.pathTarifs);
+                    } catch (e) {
+                        setSyncLog(`❌ Erreur accès dossier Tarifs: ${e.message}`);
+                        throw e; // Arrêt si on ne peut même pas lister
+                    }
+
                     const dbxTarifs = listTarifs.entries.filter(e => e['.tag'] === 'file' && e.name.toLowerCase().endsWith('.pdf'));
+                    
+                    // Nettoyage des orphelins (fichiers supprimés de Dropbox)
                     currentTarifs = currentTarifs.filter(t => dbxTarifs.find(df => df.id === t.id));
                     
                     let processed = 0;
+                    let errors = 0;
+
                     for (const file of dbxTarifs) {
                         const existing = currentTarifs.find(t => t.id === file.id);
                         if (forceAll || !existing || existing.server_modified !== file.server_modified) {
-                            setSyncLog(`   > Indexation : ${file.name}...`);
-                            const blob = await dbxDownloadFile(dbxConfig.token, file.path_lower);
-                            await delay(1000);
-                            const analysis = await analyzePDF(blob, file.name);
+                            setSyncLog(`   > Traitement : ${file.name}...`);
                             
-                            currentTarifs = currentTarifs.filter(t => t.id !== file.id);
-                            currentTarifs.push({
-                                id: file.id, name: file.name, path: file.path_lower,
-                                server_modified: file.server_modified, index_date: new Date().toLocaleString(),
-                                date_tarif: analysis.date_tarif || "Inconnue", products: analysis.products || []
-                            });
-                            processed++;
+                            try {
+                                // Téléchargement sécurisé
+                                const blob = await dbxDownloadFile(dbxConfig.token, file.path_lower);
+                                await delay(1000); // Pause anti-quota IA
+                                
+                                const analysis = await analyzePDF(blob, file.name);
+                                
+                                // Mise à jour de la liste
+                                currentTarifs = currentTarifs.filter(t => t.id !== file.id);
+                                currentTarifs.push({
+                                    id: file.id, name: file.name, path: file.path_lower,
+                                    server_modified: file.server_modified, index_date: new Date().toLocaleString(),
+                                    date_tarif: analysis.date_tarif || "Inconnue", products: analysis.products || []
+                                });
+                                processed++;
+                            } catch (fileErr) {
+                                errors++;
+                                setSyncLog(`   ⚠️ Erreur sur ${file.name} : ${fileErr.message}. Ignoré.`);
+                                // On continue la boucle même si un fichier échoue
+                            }
                         }
                     }
+                    
+                    // Sauvegarde intermédiaire locale
                     setTarifs(currentTarifs);
 
                     if (dbxConfig.pathFT) {
@@ -411,10 +438,12 @@
                             const dbxFiches = listFT.entries.filter(e => e['.tag'] === 'file');
                             currentFiches = dbxFiches.map(f => ({ id: f.id, name: f.name, path: f.path_lower, type: 'ft', server_modified: f.server_modified }));
                             setFiches(currentFiches);
-                        } catch(e) {}
+                        } catch(e) {
+                            setSyncLog(`⚠️ Attention: Dossier Fiches inaccessible (${e.message})`);
+                        }
                     }
 
-                    setSyncLog(`✅ Terminé ! ${processed} tarifs traités. Publication Cloud...`);
+                    setSyncLog(`✅ Terminé ! ${processed} traités, ${errors} erreurs. Publication...`);
                     
                     const metaInfo = {
                         date: new Date().toLocaleString(),
@@ -428,7 +457,7 @@
                     setSyncStatus('success');
 
                 } catch (err) {
-                    setSyncLog(`❌ Erreur : ${err.message}`);
+                    setSyncLog(`❌ Erreur Critique : ${err.message}`);
                     setSyncStatus('error');
                 }
             };
